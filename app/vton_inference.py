@@ -53,7 +53,8 @@ class IDM_VTON_Runner:
             # 这样可以完美避开因为手动指定 diffusion_pytorch_model.safetensors 找不到文件的崩溃
             self.unet = UNet2DConditionModel.from_pretrained(
                 os.path.join(self.base_model_path, "unet"),
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
+                use_safetensors=False
             )
 
             # 2. 从云盘挂载的本地目录依次加载文字引擎、渲染器与降噪调度器 (后面保持你原本的代码完全不变)
