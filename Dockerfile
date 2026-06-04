@@ -1,17 +1,33 @@
-# 1. 使用官方带显卡驱动的 PyTorch 基础镜像
-FROM pytorch/pytorch:2.2.1-cuda12.1-cudnn8-runtime
+FROM ghcr.io/pytorch/pytorch:2.2.1-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
 
-# 2. 安装图像处理需要的系统底层依赖
-RUN apt-get update && apt-get install -y git ffmpeg libsm6 libxext6 && rm -rf /var/lib/apt/lists/*
+# 保持原装官方源，等一下我们从外部注入你 Mac 本地的科学上网网络
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
 
-# 3. 安装 RunPod SDK 和 IDM-VTON 需要的 Python 依赖包
-RUN pip install --no-cache-dir runpod diffusers transformers accelerate einops opencv-python Pillow requests
 
-# 4. 【修改点】将本地的 app 文件夹内的所有内容，复制到 Docker 镜像的工作目录中
-# 这样两个 Python 文件就会直接平铺在 Docker 镜像的 /app 目录下
+RUN pip install --no-cache-dir --default-timeout=1000 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    "numpy==1.26.4" \
+    "runpod==1.9.1" \
+    "diffusers==0.29.2" \
+    "transformers==4.40.2" \
+    "huggingface_hub==0.23.2" \
+    "accelerate==0.29.3" \
+    "einops" \
+    "opencv-python-headless" \
+    "Pillow" \
+    "requests" \
+    "tqdm"
+
+
 COPY ./app /app
+RUN mkdir -p /app/checkpoints
 
-# 5. 【修改点】因为文件已经被复制到了 /app 根目录，启动命令保持不变
 CMD ["python3", "-u", "rp_handler.py"]
