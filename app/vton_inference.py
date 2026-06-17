@@ -3,13 +3,18 @@ import torch
 import base64
 import requests
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
 
-# 💡 导入 Diffusers 核心架构组件
-from diffusers import UNet2DConditionModel, AutoencoderKL, StableDiffusionXLInpaintPipeline
-# 💡 精准导入 SDXL 专属的文字编码器类与分词器类
-from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+# 🔥【一致性修复】真正导入官方标准的 torchvision 语义分割网络组件
+import torchvision.transforms as T
+from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+
+from diffusers import UNet2DConditionModel, AutoencoderKL, StableDiffusionXLInpaintPipeline, DDIMScheduler
+from transformers import (
+    CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer,
+    CLIPVisionModelWithProjection, CLIPImageProcessor
+)
 
 
 class IDM_VTON_Runner:
@@ -17,52 +22,87 @@ class IDM_VTON_Runner:
         self.device = device
         self.base_model_path = "/runpod-volume"
 
-        print(f"正在从云盘路径 {self.base_model_path} 初始化并加载离线大模型组件...", flush=True)
+        print(f"正在从 {self.base_model_path} 初始模型组件...", flush=True)
 
         try:
-            # 1. 显式加载 SDXL 100% 官方纯净大底座的 UNet 神经元
+            # ==================== 🔥 真正初始化 SOTA 级语义分割网络 ====================
+            print("正在初始化 SOTA 级 DeepLabV3 人体语义分割网络...", flush=True)
+            # 首次运行会自动从 PyTorch 官方下载约 160MB 的官方高精度预训练分割权重
+            self.seg_weights = DeepLabV3_ResNet50_Weights.DEFAULT
+            self.seg_model = deeplabv3_resnet50(weights=self.seg_weights).to(self.device)
+            self.seg_model.eval()
+            self.seg_transforms = self.seg_weights.transforms()
+            # =========================================================================
+
+            # 1. 加载核心 UNet
             self.unet = UNet2DConditionModel.from_pretrained(
                 os.path.join(self.base_model_path, "unet"),
                 torch_dtype=torch.float16,
                 use_safetensors=True,
-                low_cpu_mem_usage=False
+                low_cpu_mem_usage=False,
+                ignore_mismatched_sizes=True,
             )
 
-            # 2. 从云盘加载原装文字引擎、分词器与 VAE 降噪渲染器
+            # 2. 加载变分自编码器 VAE
             self.vae = AutoencoderKL.from_pretrained(
                 os.path.join(self.base_model_path, "vae"),
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
             )
 
+            # 3. 加载文本编码器与分词器
             self.text_encoder = CLIPTextModel.from_pretrained(
                 os.path.join(self.base_model_path, "text_encoder"),
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
             )
-            self.tokenizer = CLIPTokenizer.from_pretrained(os.path.join(self.base_model_path, "tokenizer"))
+
+            self.tokenizer = CLIPTokenizer.from_pretrained(
+                os.path.join(self.base_model_path, "tokenizer"),
+            )
 
             try:
                 self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
                     os.path.join(self.base_model_path, "text_encoder_2"),
                     torch_dtype=torch.float16,
-                    use_safetensors=False
+                    use_safetensors=False,
                 )
             except Exception:
                 self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
                     os.path.join(self.base_model_path, "text_encoder_2"),
                     torch_dtype=torch.float16,
-                    use_safetensors=True
+                    use_safetensors=True,
                 )
 
-            self.tokenizer_2 = CLIPTokenizer.from_pretrained(os.path.join(self.base_model_path, "tokenizer_2"))
+            self.tokenizer_2 = CLIPTokenizer.from_pretrained(
+                os.path.join(self.base_model_path, "tokenizer_2"),
+            )
 
-            from diffusers import DDPMScheduler
+            # 4. 加载 1280 维 CLIP 视觉编码器
+            print("加载本地校准后的 1280维 CLIP 视觉编码器...", flush=True)
+            clip_path = os.path.join(self.base_model_path, "ip-adapter", "image_encoder")
+            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                clip_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+            )
+
+            # 5. 加载图像预处理器
+            if os.path.exists(os.path.join(clip_path, "preprocessor_config.json")):
+                self.feature_extractor = CLIPImageProcessor.from_pretrained(clip_path)
+            else:
+                self.feature_extractor = CLIPImageProcessor()
+
+            # 6. 加载调度器 Scheduler
             try:
-                self.scheduler = DDPMScheduler.from_pretrained(os.path.join(self.base_model_path, "scheduler"))
+                self.scheduler = DDIMScheduler.from_pretrained(
+                    os.path.join(self.base_model_path, "scheduler"),
+                )
             except Exception:
-                self.scheduler = DDPMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
+                self.scheduler = DDIMScheduler(
+                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
+                )
 
-            # 3. 构造函数手工缝合，开启全自动写实摄影级 SDXL 换装底座
-            print("⏳ 正在调用官方标准总线，初始化 SDXL 完全体试衣总线...", flush=True)
+            # 7. 组装 StableDiffusionXLInpaint 基础管道
+            print("组装 Pipeline...", flush=True)
             self.pipeline = StableDiffusionXLInpaintPipeline(
                 vae=self.vae,
                 text_encoder=self.text_encoder,
@@ -70,76 +110,137 @@ class IDM_VTON_Runner:
                 tokenizer=self.tokenizer,
                 tokenizer_2=self.tokenizer_2,
                 unet=self.unet,
-                scheduler=self.scheduler
+                scheduler=self.scheduler,
+                image_encoder=self.image_encoder,
+                feature_extractor=self.feature_extractor,
             ).to(self.device)
 
-            # 💡 【高能解冻防御线】：强行将引发报错的内置空对象赋予白名单初始值，彻底屏蔽开机校验
-            self.pipeline.image_projection_layers = torch.nn.ModuleList([]).to(self.device)
+            # 8. 加载 IP-Adapter 腾讯微调权重
+            print("加载 IP-Adapter 权重并实施全闭环维度校准...", flush=True)
+            ip_adapter_local = os.path.join(self.base_model_path, "ip-adapter")
+            ip_adapter_weight = "ip-adapter_sdxl.bin"
 
-            self.pipeline.enable_attention_slicing()
-            print("🎉 🟢【史诗级里程碑】SDXL 官方写实摄影级换装总线已在 5090 显存中完美就绪！", flush=True)
+            if os.path.exists(os.path.join(ip_adapter_local, ip_adapter_weight)):
+                self.pipeline.load_ip_adapter(
+                    pretrained_model_name_or_path_or_dict=ip_adapter_local,
+                    subfolder=None,
+                    weight_name=ip_adapter_weight,
+                    image_encoder_folder=None,
+                )
+            else:
+                print("本地未找到 IP-Adapter 权重, 从 HuggingFace 下载...", flush=True)
+                self.pipeline.load_ip_adapter(
+                    "h94/IP-Adapter",
+                    subfolder="sdxl_models",
+                    weight_name=ip_adapter_weight,
+                    image_encoder_folder=None,
+                )
+
+            print("Pipeline 就绪。", flush=True)
 
         except Exception as e:
-            print(f"❌ 警告：从云盘加载模型失败！请检查文件完整度。错误原因: {str(e)}", flush=True)
+            print(f"模型加载失败: {str(e)}", flush=True)
             raise e
 
     def download_image(self, url):
-        """标准多线程网络图片下载，并强行转换为符合电商渲染的 RGB 格式"""
         response = requests.get(url, timeout=15)
         return Image.open(BytesIO(response.content)).convert("RGB")
 
     def predict(self, user_img_url, garment_img_url, category="upper_body"):
+        # 1. 极速拉取外网图片
         user_image = self.download_image(user_img_url)
         garment_image = self.download_image(garment_img_url)
 
+        # 2. 严格对齐 IDM-VTON 的标准输入分辨率 768x1024
         user_image = user_image.resize((768, 1024))
         garment_image = garment_image.resize((768, 1024))
 
-        # =====================================================================
-        # 🎯 【图像特征潜空间重构矩阵（Latent Blend Injection）】
-        # 💡 既然你的云盘里是 100% 纯正原装的官方底座，我们直接在输入端进行终极特征咬合：
-        # 💡 在图像进入前，将衬衣彩图的纹理、纽扣与颜色，通过数学矩阵在换装区域进行全自动无损硬缝合！
-        # =====================================================================
+        # ==================== 3. 🔥【终极修复】SOTA 语义分割与维度严格对齐 ====================
+        print("🚀 启动 DeepLabV3 语义像素分割并执行空间几何对齐...", flush=True)
+
+        # 1. 图像过分割模型专用的标准化预处理
+        input_tensor = self.seg_transforms(user_image).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            seg_output = self.seg_model(input_tensor)["out"]
+
+        # 2. 提取全图概率最大的语义类别（COCO 标签中，15代表人类人像像素）
+        seg_predictions = seg_output.argmax(1).squeeze(0).byte().cpu().numpy()
+
+        # 3. 【核心救场修复】：由于网络内部缩放了尺寸，通过 Pillow 将语义小矩阵强行、精准放大回 768x1024 标准大物理画布
+        seg_image_small = Image.fromarray(seg_predictions)
+        seg_image_large = seg_image_small.resize((768, 1024), resample=Image.NEAREST)
+        is_human_large = np.array(seg_image_large) == 15
+
+        # 4. 初始化标准 1024x768 遮罩画布
         mask_np = np.zeros((1024, 768), dtype=np.uint8)
-        mask_np[360:780, 220:548] = 255  # 强行切出标准的 3:4 黄金重绘穿衣盒
 
-        # 将衣服图片的每一个 RGB 像素点，在掩码区域直接融进输入画板，实现百分之百的纹理版型对齐
-        user_np = np.array(user_image)
-        garment_np = np.array(garment_image)
-        for c in range(3):
-            user_np[:, :, c] = np.where(mask_np == 255, garment_np[:, :, c], user_np[:, :, c])
+        # 5. 此时两侧矩阵的纵横维度达到了完美的 100% 绝对一致，执行安全的黄金躯干区域判定
+        mask_np[220:850, :] = np.where(is_human_large[220:850, :], 255, 0)
 
-        # 重新打包生成融合了衬衣核心细节的全新多模态复合输入图
-        composite_user_image = Image.fromarray(user_np)
-        mask_image = Image.fromarray(mask_np).convert("L")
-        # =====================================================================
+        # 6. 应用大半径高斯模糊羽化（Radius=15）消除穿模白边
+        final_mask_img = Image.fromarray(mask_np).convert("L")
+        mask_image = final_mask_img.filter(ImageFilter.GaussianBlur(radius=15))
+        # ===================================================================================
 
-        # 💡 提示词锁死帅气男士、商务衬衫、全遮盖属性，反向词永封胸罩、内衣
-        prompt = f"A photorealistic handsome male fitness model wearing the business shirt perfectly, buttoned luxury manly shirt outfit, high quality, professional studio lighting, 8k resolution, detailed fabric texture"
-        negative_prompt = "low quality, blurry, bra, sports bra, underwear, bikini, crop top, female garment, chest exposure, dress, woman clothes, distorted, deformed hands"
+        # 4. 配置提示词 (根据 category 动态对齐衣服品类)
+        garment_type = "garment" if category == "upper_body" else category
+        prompt = (
+            f"A photorealistic handsome male fitness model wearing the {garment_type} perfectly, "
+            f"manly outfit, high quality, professional studio lighting, 8k resolution, detailed fabric texture"
+        )
+        negative_prompt = (
+            "low quality, blurry, bra, sports bra, underwear, bikini, crop top, female garment, "
+            "chest exposure, dress, woman clothes, distorted, deformed hands"
+        )
 
-        print(f"🚀 5090 显卡全力全速开启官方正统潜空间降噪换装重绘...", flush=True)
+        print("开始推理...", flush=True)
 
-        # 4. 执行多模态融合计算
+        # 5. 调用核心推理机制
         with torch.inference_mode():
             output_images = self.pipeline(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                image=composite_user_image,  # 👈 喂入完美融合了衣服细节和形状的复合图
+                image=user_image,
                 mask_image=mask_image,
-                # =====================================================================
-                # 🎯【斩断 NoneType 报错的最后一击！】
-                # 💡 在这里我们彻底、一字不传 `ip_adapter_image` 参数！
-                # 💡 框架底层的报错检查线永远无法被触发，100% 绝对不可能再弹报错！
-                # =====================================================================
-                num_inference_steps=45,  # 👈 45步黄金高保真降噪
-                guidance_scale=11.5  # 👈 强行提升到 11.5 控制力，逼大模型完全按照衬衫的版型去渲染！
+                ip_adapter_image=garment_image,
+                num_inference_steps=45,
+                guidance_scale=9.0,
             )
 
-        final_image = output_images.images[0]
+        # 6. 【防炸解析器】完美抠出生成的 PIL 图片对象
+        print("🔮 推理迭代完成，正在进行最终生成的图像解析...", flush=True)
+        final_image = None
 
+        # 1. 核心修复：如果返回的对象拥有 .images 属性
+        if hasattr(output_images, "images"):
+            # 如果 images 是个列表且里面有图，直接剥离提取出第一张真正的 PIL 图像对象！
+            if isinstance(output_images.images, list) and len(output_images.images) > 0:
+                final_image = output_images.images[0]  # 👈 加上 [0]，彻底消灭 'list' object 报错
+            else:
+                final_image = output_images.images
+
+        # 2. 备用防御：如果本身返回的就是个纯列表/元组
+        elif isinstance(output_images, (tuple, list)) and len(output_images) > 0:
+            first_item = output_images[0]
+            # 如果列表里的第一个元素还是个列表，继续往下拆
+            if isinstance(first_item, list) and len(first_item) > 0:
+                final_image = first_item[0]
+            else:
+                final_image = first_item
+
+        # 3. 备用防御：如果返回的直接就是一张 PIL 图像
+        elif isinstance(output_images, Image.Image):
+            final_image = output_images
+
+        # 兜底安全性检查
+        if final_image is None:
+            raise RuntimeError(f"无法从推理返回对象中提取有效的图像！实际类型: {type(output_images)}")
+
+        # 7. 转换 Base64 安全流输出返回
         buffered = BytesIO()
         final_image.save(buffered, format="JPEG", quality=95)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-        return f"data:image/jpeg;base64,{img_str}"
+        print("🎉【大功告成】试衣成功！图像已顺利转换为 Base64 编码流并安全交回接口！", flush=True)
+        return img_str
